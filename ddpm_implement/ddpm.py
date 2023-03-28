@@ -151,6 +151,178 @@ class LayerNorm(nn.Module):
         var = torch.var(x, dim=1, unbiased=False, keepdim=True)
         mean = torch.mean(x, dim=1, keepdim=True)
         return (x - mean) * (var + eps).rsqrt() * self.g
+    
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
+    
+"""
+Sinusoidal positional embed
+"""
+
+# Transformer model 의 Positianl Encoding 을 활용
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
+class RandomOrLearnedSinusoidalEmb(nn.Module):
+    """ following @crowsonkb 's lead with random (learned optional) sinusoidal pos emb """
+    """ https://github.com/crowsonkb/v-diffusion-jax/blob/master/diffusion/models/danbooru_128.py#L8 """
+
+    def __init__(self, dim, is_random=False):
+        super().__init__()    
+        assert (dim % 2) == 0
+        half_dim = dim // 2
+        self.weight = nn.Parameter(torch.randn(half_dim), requires_grad= not is_random)
+
+    def forward(self, x):
+        x = rearrange(x, 'b -> b 1')
+        freqs = x * rearrange(self.weight, 'd -> 1 d') * 2 * math.pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+        fouriered = torch.cat((x, fouriered), dim=-1)
+        return fouriered
+    
+
+"""
+building block modules
+"""
+
+# Resnet 내 block modules
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, groups=8): # group parameter 의미??
+        super().__init__()
+        self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding=1)
+        self.norm = nn.GroupNorm(groups, dim_out) # WeightStandardizedConv 를 쓴 이후에 다시 GroupNorm 을 쓰는 이유는???
+        self.act = nn.SiLU()
+
+    def forward(self, x, scale_shift=None): # scale_shift??
+        x = self.proj(x)
+        x = self.norm(x)
+
+        if exist(scale_shift):
+            scale, shift = scale_shift
+            x = x * (scale + 1) + shift
+
+        x = self.act(x)
+        return x
+    
+
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
+        super().__init__()
+        # time_emb 이 있을 경우
+        if time_emb_dim is not None:
+            self.mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, dim_out*2))
+        else:
+            self.mlp = None
+        
+        self.block1 = Block(dim, dim_out, groups=groups)
+        self.block2 = Block(dim_out, dim_out, groups=groups)
+
+        if dim != dim_out:
+            self.res_cov = nn.Conv2d(dim, dim_out, 1)
+        else:
+            self.res_cov = nn.Identity()
+
+    def forward(self, x, time_emb=None):
+        scale_shift = None
+
+        if exist(self.mlp) and exist(time_emb):
+            time_emb = self.mlp(time_emb)
+            time_emb = rearrange(time_emb, 'b c -> b c 1 1')
+            scale_shift = time_emb.chunk(2, dim=1) # chunk ??
+
+        h = self.block1(x, scale_shift=scale_shift) # scale_shift 는 어떤 값인가?
+        h = self.block2(h)
+
+        return h + self.res_cov(x)
+    
+
+# self-attension layer
+class LinearAttention(nn.Module):
+    def __init__(self, dim, heads=4, dim_head=32):
+        super().__init__()
+        self.scale = dim_head ** -0.5 # sqrt(dimension of K vector)
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim*3, 1, bias=False) # qkv vector 를 만드는데 왜 Convolution 연산??
+
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1),
+                                    LayerNorm(dim))
+        
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h=self.heads), qkv)
+
+        q = q.softmax(dim = -2)
+        k = k.softmax(dim = -1)
+
+        q = q * self.scale
+        v = v / (h * w)
+
+        context = torch.einsum('b h d n, b h e n -> b h d e', k, v) #einsum 함수 찾아보기
+
+        out = torch.einsum('b h d e, b h d n -> b h e n', context, q)
+        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h=self.heads, x=h, y=w)
+        return self.to_out(out)
+
+
+class Attention(nn.Module):
+    pass
+
+
+"""
+Model
+"""
+class Unet(nn.Module):
+    def __init__(self,
+                 dim, 
+                 init_dim=None,
+                 out_dim=None,
+                 dim_mults=(1, 2, 4, 8),
+                 channels=3,
+                 self_condition=False,
+                 resnet_block_groups=8,
+                 learned_variance=False,
+                 learned_sinsoidal_cond=False,
+                 random_fourier_features=False,
+                 learned_sinsoidal_dim=16):
+        super().__init__()
+        
+        # determine dimensions
+        self.channels = channels
+        self.self_condition = self_condition
+        input_channels = channels * (2 if self_condition else 1)
+
+        init_dim = default(init_dim, dim) # init dim 이 있으면 init dim, 아니면 dim
+        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
+
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        block_klass = partial(ResnetBlock, groups=resnet_block_groups)
+
+
 
 if __name__ == "__main__":
-    print(num_to_groups(10, 3))
+    pass
