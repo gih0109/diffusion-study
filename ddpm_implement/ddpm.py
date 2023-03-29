@@ -286,13 +286,13 @@ class LinearAttention(nn.Module):
         out = rearrange(out, 'b h c (x y) -> b (h c) x y', h=self.heads, x=h, y=w)
         return self.to_out(out)
 
-
+"""TODO"""
 class Attention(nn.Module):
     pass
 
 
 """
-Model
+Unet Model
 """
 class Unet(nn.Module):
     def __init__(self,
